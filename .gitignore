@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+.venv/
+reddit_reviews_*.jsonl
+reddit_reviews_*.json
+reddit_reviews_*.csv
+data/*.jsonl
+data/*.json
+data/*.csv
