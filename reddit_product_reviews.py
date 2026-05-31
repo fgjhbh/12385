@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import html
 import json
 import re
 import sys
@@ -17,6 +18,8 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import webbrowser
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -25,6 +28,55 @@ from typing import Any, Iterable, Iterator, Sequence
 DEFAULT_USER_AGENT = "reddit-product-review-research/1.0 (contact: local-script)"
 REDDIT_BASE = "https://www.reddit.com"
 WORD_RE = re.compile(r"[A-Za-z0-9_']+")
+
+PAIN_POINT_TERMS = {
+    "price": [
+        "expensive",
+        "overpriced",
+        "cost",
+        "costly",
+        "pricing",
+        "subscription",
+        "贵",
+        "太贵",
+    ],
+    "bugs": ["bug", "bugs", "broken", "crash", "crashes", "error", "glitch", "报错"],
+    "usability": [
+        "confusing",
+        "hard to use",
+        "difficult",
+        "learning curve",
+        "clunky",
+        "难用",
+        "不好用",
+    ],
+    "performance": ["slow", "lag", "lags", "latency", "freezes", "卡", "很慢"],
+    "support": [
+        "support",
+        "customer service",
+        "refund",
+        "unresponsive",
+        "客服",
+        "退款",
+    ],
+    "missing_features": [
+        "missing",
+        "lack",
+        "lacks",
+        "wish it had",
+        "feature request",
+        "缺少",
+    ],
+}
+DEFAULT_REVIEW_TERMS = [
+    "review",
+    "pros",
+    "cons",
+    "recommend",
+    "alternative",
+    "vs",
+    *dict.fromkeys(term for terms in PAIN_POINT_TERMS.values() for term in terms),
+]
 
 
 @dataclass(slots=True)
@@ -42,6 +94,7 @@ class ReviewRecord:
     title: str
     body: str
     matched_terms: str
+    pain_points: str
     sentiment: str
     url: str
 
@@ -157,6 +210,17 @@ def find_matched_terms(
     return matches
 
 
+def classify_pain_points(text: str) -> list[str]:
+    """Return pain-point categories detected in a text block."""
+
+    lowered = text.lower()
+    categories: list[str] = []
+    for category, terms in PAIN_POINT_TERMS.items():
+        if any(term.lower() in lowered for term in terms):
+            categories.append(category)
+    return categories
+
+
 def simple_sentiment(text: str) -> str:
     """Classify sentiment with a small transparent keyword heuristic."""
 
@@ -222,6 +286,9 @@ def make_post_record(
         title=post.get("title", ""),
         body=post.get("selftext", ""),
         matched_terms=", ".join(matched_terms),
+        pain_points=", ".join(
+            classify_pain_points(f"{post.get('title', '')}\n{post.get('selftext', '')}")
+        ),
         sentiment=simple_sentiment(
             f"{post.get('title', '')}\n{post.get('selftext', '')}"
         ),
@@ -250,6 +317,7 @@ def make_comment_record(
         title=post.get("title", ""),
         body=comment.get("body", ""),
         matched_terms=", ".join(matched_terms),
+        pain_points=", ".join(classify_pain_points(comment.get("body", ""))),
         sentiment=simple_sentiment(comment.get("body", "")),
         url=f"{REDDIT_BASE}{permalink}" if permalink else "",
     )
@@ -349,6 +417,195 @@ def write_records(records: Iterable[ReviewRecord], output: str, fmt: str) -> Non
         raise ValueError(f"不支持的输出格式: {fmt}")
 
 
+INDEX_HTML = """<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Reddit 产品痛点抓取器</title>
+  <style>
+    body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; color: #1f2937; }
+    label { display: block; font-weight: 600; margin-top: 1rem; }
+    input, textarea, select { width: min(760px, 100%); padding: .65rem; margin-top: .35rem; border: 1px solid #cbd5e1; border-radius: .5rem; }
+    button { margin-top: 1rem; padding: .8rem 1.2rem; border: 0; border-radius: .6rem; background: #ff4500; color: white; font-weight: 700; cursor: pointer; }
+    button:disabled { opacity: .6; cursor: wait; }
+    .hint { color: #64748b; font-size: .92rem; }
+    .status { margin: 1rem 0; font-weight: 700; }
+    table { border-collapse: collapse; width: 100%; margin-top: 1rem; font-size: .9rem; }
+    th, td { border: 1px solid #e2e8f0; padding: .45rem; text-align: left; vertical-align: top; }
+    th { background: #f8fafc; }
+  </style>
+</head>
+<body>
+  <h1>Reddit 产品痛点/评价一键抓取器</h1>
+  <p class="hint">输入产品名，点击按钮后会抓取 Reddit 帖子和评论，并自动标记价格、Bug、易用性、性能、客服、缺失功能等痛点。</p>
+  <form id="collector">
+    <label>产品名（每行一个，必填）</label>
+    <textarea name="products" rows="4" placeholder="Notion\nLinear\nObsidian" required></textarea>
+    <label>Subreddit（可选，每行一个；留空为全站搜索）</label>
+    <textarea name="subreddits" rows="3" placeholder="SaaS\nproductivity"></textarea>
+    <label>额外关键词（可选，每行一个）</label>
+    <textarea name="review_terms" rows="3" placeholder="pricing\nalternative\nbug"></textarea>
+    <label>每个产品/社区搜索帖子数</label>
+    <input name="limit" type="number" min="1" max="100" value="25">
+    <label>每帖最多评论数</label>
+    <input name="comments_per_post" type="number" min="0" max="500" value="50">
+    <label>时间范围</label>
+    <select name="time"><option value="year">过去一年</option><option value="month">过去一月</option><option value="week">过去一周</option><option value="all">全部</option></select>
+    <label>输出格式</label>
+    <select name="format"><option value="jsonl">JSONL</option><option value="csv">CSV</option><option value="json">JSON</option></select>
+    <button id="run" type="submit">开始抓取 Reddit 数据</button>
+  </form>
+  <div id="status" class="status"></div>
+  <div id="result"></div>
+<script>
+const form = document.getElementById('collector');
+const statusBox = document.getElementById('status');
+const resultBox = document.getElementById('result');
+const button = document.getElementById('run');
+form.addEventListener('submit', async (event) => {
+  event.preventDefault();
+  button.disabled = true;
+  statusBox.textContent = '正在抓取，请稍等……';
+  resultBox.innerHTML = '';
+  try {
+    const response = await fetch('/api/collect', { method: 'POST', body: new URLSearchParams(new FormData(form)) });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || '抓取失败');
+    statusBox.innerHTML = `已抓取 ${data.count} 条记录，文件：<code>${data.output}</code>，<a href="/download?file=${encodeURIComponent(data.output)}">下载</a>`;
+    renderTable(data.records);
+  } catch (error) {
+    statusBox.textContent = `错误：${error.message}`;
+  } finally {
+    button.disabled = false;
+  }
+});
+function renderTable(records) {
+  const rows = records.slice(0, 100).map((r) => `<tr><td>${esc(r.product)}</td><td>${esc(r.source_type)}</td><td>${esc(r.subreddit)}</td><td>${esc(r.sentiment)}</td><td>${esc(r.pain_points)}</td><td>${esc(r.title)}</td><td>${esc(r.body).slice(0, 400)}</td><td><a href="${esc(r.url)}" target="_blank">打开</a></td></tr>`).join('');
+  resultBox.innerHTML = `<p class="hint">下方最多预览前 100 条。</p><table><thead><tr><th>产品</th><th>来源</th><th>社区</th><th>情感</th><th>痛点</th><th>标题</th><th>内容</th><th>链接</th></tr></thead><tbody>${rows}</tbody></table>`;
+}
+function esc(value) { return String(value || '').replace(/[&<>"]/g, (ch) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[ch])); }
+</script>
+</body>
+</html>
+"""
+
+
+def split_form_list(value: str) -> list[str]:
+    """Split textarea values by newlines or commas and drop blanks."""
+
+    return [item.strip() for item in re.split(r"[\n,]+", value) if item.strip()]
+
+
+def build_args_from_form(
+    form: dict[str, list[str]], base_args: argparse.Namespace
+) -> argparse.Namespace:
+    """Create collector args from a submitted web form."""
+
+    products = split_form_list(form.get("products", [""])[0])
+    subreddits = split_form_list(form.get("subreddits", [""])[0])
+    custom_review_terms = split_form_list(form.get("review_terms", [""])[0])
+    review_terms = list(dict.fromkeys([*DEFAULT_REVIEW_TERMS, *custom_review_terms]))
+    fmt = form.get("format", ["jsonl"])[0]
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H-%M-%S")
+    return argparse.Namespace(
+        product=products,
+        products_file=None,
+        subreddit=subreddits,
+        review_term=review_terms,
+        limit=int(form.get("limit", ["25"])[0]),
+        comments_per_post=int(form.get("comments_per_post", ["50"])[0]),
+        sort="relevance",
+        time=form.get("time", ["year"])[0],
+        comment_sort="top",
+        format=fmt,
+        output=f"reddit_reviews_{now}.{fmt}",
+        delay=base_args.delay,
+        timeout=base_args.timeout,
+        retries=base_args.retries,
+        user_agent=base_args.user_agent,
+    )
+
+
+def serve_web_app(args: argparse.Namespace) -> int:
+    """Start the one-click Reddit collector web UI."""
+
+    class RedditCollectorHandler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path == "/":
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.end_headers()
+                self.wfile.write(INDEX_HTML.encode("utf-8"))
+                return
+            if parsed.path == "/download":
+                params = urllib.parse.parse_qs(parsed.query)
+                filename = params.get("file", [""])[0]
+                path = Path(filename).resolve()
+                if (
+                    not filename
+                    or path.parent != Path.cwd().resolve()
+                    or not path.exists()
+                ):
+                    self.send_error(404, "file not found")
+                    return
+                self.send_response(200)
+                self.send_header("Content-Type", "application/octet-stream")
+                self.send_header(
+                    "Content-Disposition",
+                    f"attachment; filename={html.escape(path.name)}",
+                )
+                self.end_headers()
+                self.wfile.write(path.read_bytes())
+                return
+            self.send_error(404)
+
+        def do_POST(self) -> None:
+            if self.path != "/api/collect":
+                self.send_error(404)
+                return
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length).decode("utf-8")
+            form = urllib.parse.parse_qs(body)
+            try:
+                collector_args = build_args_from_form(form, args)
+                if collector_args.limit < 1 or collector_args.limit > 100:
+                    raise ValueError("limit 必须在 1 到 100 之间")
+                if collector_args.comments_per_post < 0:
+                    raise ValueError("comments_per_post 不能小于 0")
+                records = collect_reviews(collector_args)
+                write_records(records, collector_args.output, collector_args.format)
+                payload = {
+                    "count": len(records),
+                    "output": collector_args.output,
+                    "records": [asdict(record) for record in records],
+                }
+                self.send_json(200, payload)
+            except (RuntimeError, ValueError, SystemExit) as exc:
+                self.send_json(400, {"error": str(exc)})
+
+        def send_json(self, status: int, payload: dict[str, Any]) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(json.dumps(payload, ensure_ascii=False).encode("utf-8"))
+
+        def log_message(self, format: str, *log_args: Any) -> None:
+            print(f"{self.address_string()} - {format % log_args}")
+
+    server = ThreadingHTTPServer((args.host, args.port), RedditCollectorHandler)
+    url = f"http://{args.host}:{args.port}"
+    print(f"Reddit 产品痛点抓取器已启动: {url}")
+    if not args.no_open:
+        webbrowser.open(url)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        print("\n已停止网页服务。")
+    return 0
+
+
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     """Parse command-line arguments."""
 
@@ -367,7 +624,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--review-term",
         action="append",
-        default=["review", "pros", "cons", "recommend", "alternative", "vs", "pricing"],
+        default=DEFAULT_REVIEW_TERMS,
         help="额外评论意图关键词，可重复传入。",
     )
     parser.add_argument(
@@ -410,6 +667,12 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument(
         "--user-agent", default=DEFAULT_USER_AGENT, help="Reddit 请求 User-Agent。"
     )
+    parser.add_argument("--serve", action="store_true", help="启动一键抓取网页界面。")
+    parser.add_argument("--host", default="127.0.0.1", help="网页界面监听地址。")
+    parser.add_argument("--port", type=int, default=8765, help="网页界面监听端口。")
+    parser.add_argument(
+        "--no-open", action="store_true", help="启动网页界面后不自动打开浏览器。"
+    )
     return parser.parse_args(argv)
 
 
@@ -417,6 +680,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     """CLI entrypoint."""
 
     args = parse_args(argv or sys.argv[1:])
+    if args.serve:
+        return serve_web_app(args)
     if args.limit < 1 or args.limit > 100:
         raise SystemExit("--limit 必须在 1 到 100 之间。")
     if args.comments_per_post < 0:
