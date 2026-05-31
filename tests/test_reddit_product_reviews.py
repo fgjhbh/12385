@@ -1,10 +1,14 @@
 from reddit_product_reviews import (
+    build_args_from_form,
     build_search_url,
+    classify_pain_points,
     extract_comments,
     find_matched_terms,
     iter_search_posts,
     load_products,
+    parse_args,
     simple_sentiment,
+    split_form_list,
 )
 
 
@@ -75,6 +79,49 @@ def test_simple_sentiment_keyword_heuristic():
     assert simple_sentiment("great useful fast") == "positive"
     assert simple_sentiment("bad slow bugs") == "negative"
     assert simple_sentiment("plain mention") == "neutral"
+
+
+def test_classify_pain_points_detects_customer_complaints():
+    assert classify_pain_points("Too expensive and the app is slow") == [
+        "price",
+        "performance",
+    ]
+
+
+def test_split_form_list_accepts_newlines_and_commas():
+    assert split_form_list("Notion, Linear\n\nObsidian") == [
+        "Notion",
+        "Linear",
+        "Obsidian",
+    ]
+
+
+def test_build_args_from_form_creates_collector_namespace():
+    base_args = parse_args(["--serve", "--no-open", "--delay", "0", "--timeout", "5"])
+    collector_args = build_args_from_form(
+        {
+            "products": ["Notion\nLinear"],
+            "subreddits": ["productivity"],
+            "review_terms": ["pricing\nbug"],
+            "limit": ["10"],
+            "comments_per_post": ["3"],
+            "time": ["month"],
+            "format": ["csv"],
+        },
+        base_args,
+    )
+
+    assert collector_args.product == ["Notion", "Linear"]
+    assert collector_args.subreddit == ["productivity"]
+    assert "review" in collector_args.review_term
+    assert "pricing" in collector_args.review_term
+    assert "bug" in collector_args.review_term
+    assert collector_args.limit == 10
+    assert collector_args.comments_per_post == 3
+    assert collector_args.time == "month"
+    assert collector_args.format == "csv"
+    assert collector_args.delay == 0
+    assert collector_args.timeout == 5
 
 
 def test_load_products_dedupes_cli_and_file(tmp_path):
